@@ -74,3 +74,52 @@ CREATE TABLE IF NOT EXISTS xgw_dashboards (
   updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 CREATE INDEX IF NOT EXISTS idx_xgw_dashboards_token ON xgw_dashboards(token);
+
+-- Gateway Watch: uptime + 402-validity monitoring for paid endpoints.
+-- Watches belong to gateway services (admin-key auth) and ride the service's
+-- Pro subscription: Free gets 1 watch with daily checks and no alerts, Pro
+-- gets up to 10 watches with 15-minute checks, email + webhook alerts, and a
+-- public status page. Kept separate so the schema stays additive.
+CREATE TABLE IF NOT EXISTS xgw_watches (
+  id TEXT PRIMARY KEY,
+  service_id TEXT REFERENCES xgw_services(id) ON DELETE CASCADE,
+  label TEXT NOT NULL DEFAULT '',
+  target_url TEXT NOT NULL,
+  expect_402 INTEGER NOT NULL DEFAULT 1,
+  webhook_url TEXT NOT NULL DEFAULT '',
+  alert_email INTEGER NOT NULL DEFAULT 1,
+  status TEXT NOT NULL DEFAULT 'unknown' CHECK (status IN ('unknown', 'ok', 'failing', 'paused')),
+  paused INTEGER NOT NULL DEFAULT 0,
+  last_status INTEGER,
+  last_latency_ms INTEGER,
+  last_price_sats INTEGER,
+  last_pay_to TEXT NOT NULL DEFAULT '',
+  last_error TEXT NOT NULL DEFAULT '',
+  last_checked_at TEXT,
+  consecutive_failures INTEGER NOT NULL DEFAULT 0,
+  alerted_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_xgw_watches_service ON xgw_watches(service_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_xgw_watches_due ON xgw_watches(paused, last_checked_at);
+
+-- Bounded per-watch check history (pruned by the cron runner).
+CREATE TABLE IF NOT EXISTS xgw_watch_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  watch_id TEXT NOT NULL REFERENCES xgw_watches(id) ON DELETE CASCADE,
+  ok INTEGER NOT NULL,
+  status INTEGER,
+  latency_ms INTEGER,
+  price_sats INTEGER,
+  error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_xgw_watch_checks_watch ON xgw_watch_checks(watch_id, created_at DESC);
+
+-- Annual billing lives on the same subscription row as monthly Pro.
+-- NULL means monthly (pre-interval rows and events without metadata).
+ALTER TABLE xgw_subscriptions ADD COLUMN billing_interval TEXT;
+-- Credential encryption (GATEWAY_CREDS_KEY, AES-GCM envelope). Pre-key rows
+-- keep plaintext auth_value and migrate on next admin write.
+ALTER TABLE xgw_services ADD COLUMN auth_value_enc TEXT;

@@ -8,6 +8,7 @@ import Stripe from "stripe";
 import type { Env } from "./x402.ts";
 import { HttpError } from "./store.ts";
 import {
+  annualProPriceCents,
   ensureSubscription,
   findServiceByStripe,
   proPriceCents,
@@ -97,24 +98,30 @@ export async function createProCheckout(
   env: Env,
   service: ServiceLike,
   origin: string,
-): Promise<{ url: string; sessionId: string; priceCents: number }> {
+  interval: "month" | "year" = "month",
+): Promise<{ url: string; sessionId: string; priceCents: number; interval: "month" | "year" }> {
   if (!stripeConfigured(env)) throw new HttpError(503, "Stripe is not configured");
   assertLiveOnProduction(origin, env);
-  const priceCents = proPriceCents(env);
+  const monthly = proPriceCents(env);
+  const priceCents = interval === "year" ? annualProPriceCents(env) : monthly;
   const stripe = stripeClient(env);
   const customer = await ensureCustomer(env, stripe, service);
   const cleanOrigin = origin.replace(/\/$/, "");
-  const lineItem: Stripe.Checkout.SessionCreateParams.LineItem = env.STRIPE_PRICE_GATEWAY_PRO
-    ? { quantity: 1, price: env.STRIPE_PRICE_GATEWAY_PRO }
+  const precreated = interval === "year" ? env.STRIPE_PRICE_GATEWAY_PRO_ANNUAL : env.STRIPE_PRICE_GATEWAY_PRO;
+  const lineItem: Stripe.Checkout.SessionCreateParams.LineItem = precreated
+    ? { quantity: 1, price: precreated }
     : {
         quantity: 1,
         price_data: {
           currency: "usd",
           unit_amount: priceCents,
-          recurring: { interval: "month" },
+          recurring: { interval },
           product_data: {
-            name: "x402 Gateway Pro",
-            description: "100 routes, per-call analytics, CSV export",
+            name: interval === "year" ? "x402 Gateway Pro (annual)" : "x402 Gateway Pro",
+            description:
+              interval === "year"
+                ? "100 routes, per-call analytics, CSV export, uptime monitoring — billed annually (20% off)"
+                : "100 routes, per-call analytics, CSV export",
           },
         },
       };
@@ -126,8 +133,8 @@ export async function createProCheckout(
       line_items: [lineItem],
       success_url: `${cleanOrigin}/?upgrade=success&service=${encodeURIComponent(service.slug)}`,
       cancel_url: `${cleanOrigin}/?upgrade=cancel&service=${encodeURIComponent(service.slug)}`,
-      metadata: { kind: "gateway_pro", serviceId: service.id, slug: service.slug },
-      subscription_data: { metadata: { serviceId: service.id, slug: service.slug } },
+      metadata: { kind: "gateway_pro", serviceId: service.id, slug: service.slug, interval },
+      subscription_data: { metadata: { serviceId: service.id, slug: service.slug, interval } },
       integration_identifier: integrationIdentifier("x402gw_pro"),
     })
     .catch(throwStripe);
@@ -139,8 +146,9 @@ export async function createProCheckout(
     plan: "pro",
     status: "incomplete",
     stripeCustomerId: customer,
+    billingInterval: interval,
   });
-  return { url: session.url, sessionId: session.id, priceCents };
+  return { url: session.url, sessionId: session.id, priceCents, interval };
 }
 
 export async function createBillingPortal(
@@ -190,6 +198,7 @@ function stripeId(value: unknown): string | null {
 function subscriptionFields(sub: StripeSubscriptionShape) {
   const item = sub.items?.data?.[0];
   const periodEnd = sub.current_period_end ?? item?.current_period_end ?? null;
+  const interval = sub.metadata?.interval;
   return {
     serviceId: sub.metadata?.serviceId ?? null,
     stripeSubscriptionId: sub.id,
@@ -197,6 +206,8 @@ function subscriptionFields(sub: StripeSubscriptionShape) {
     status: sub.status,
     currentPeriodEnd: periodEnd ? new Date(periodEnd * 1000).toISOString() : null,
     cancelAtPeriodEnd: Boolean(sub.cancel_at_period_end),
+    // Null when the event carries no interval: upsert keeps the stored value.
+    billingInterval: interval === "year" ? ("year" as const) : interval === "month" ? ("month" as const) : null,
   };
 }
 
@@ -252,6 +263,7 @@ async function processEvent(env: Env, event: Stripe.Event): Promise<void> {
         stripeSubscriptionId: fields.stripeSubscriptionId,
         currentPeriodEnd: fields.currentPeriodEnd,
         cancelAtPeriodEnd: event.type === "customer.subscription.deleted" ? false : fields.cancelAtPeriodEnd,
+        billingInterval: fields.billingInterval,
       });
       return;
     }

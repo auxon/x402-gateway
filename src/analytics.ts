@@ -32,6 +32,20 @@ export interface ServiceAnalytics {
     status: number;
     ms: number;
   }[];
+  watch: {
+    watches: {
+      id: string;
+      label: string;
+      targetUrl: string;
+      status: string;
+      lastStatus: number | null;
+      lastLatencyMs: number | null;
+      lastPriceSats: number | null;
+      lastError: string | null;
+      lastCheckedAt: string | null;
+      consecutiveFailures: number;
+    }[];
+  };
 }
 
 interface D1Stmt {
@@ -95,7 +109,41 @@ export async function buildAnalytics(
     byDay: [],
     byRoute: [],
     recent: [],
+    watch: { watches: [] },
   };
+
+  const watchRows = await database
+    .prepare(
+      `SELECT id, label, target_url, status, paused, last_status, last_latency_ms,
+              last_price_sats, last_error, last_checked_at, consecutive_failures
+       FROM xgw_watches WHERE service_id = ? ORDER BY created_at ASC LIMIT 25`,
+    )
+    .bind(row.id)
+    .all<{
+      id: string;
+      label: string;
+      target_url: string;
+      status: string;
+      paused: number;
+      last_status: number | null;
+      last_latency_ms: number | null;
+      last_price_sats: number | null;
+      last_error: string;
+      last_checked_at: string | null;
+      consecutive_failures: number;
+    }>();
+  analytics.watch.watches = (watchRows.results ?? []).map((w) => ({
+    id: w.id,
+    label: w.label,
+    targetUrl: w.target_url,
+    status: w.paused === 1 ? "paused" : w.status,
+    lastStatus: w.last_status,
+    lastLatencyMs: w.last_latency_ms,
+    lastPriceSats: w.last_price_sats,
+    lastError: w.last_error || null,
+    lastCheckedAt: w.last_checked_at,
+    consecutiveFailures: Number(w.consecutive_failures ?? 0),
+  }));
 
   if (!pro) return analytics;
 

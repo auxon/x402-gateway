@@ -44,6 +44,9 @@ import {
   publicService,
   recordUsage,
   requireAdmin,
+  resolveAuthValue,
+  adminHash,
+  ensureCredsColumn,
   routesOf,
   sha256Hex,
   getDashboard,
@@ -58,9 +61,33 @@ import {
   type GatewayRoute,
   type ServiceRow,
 } from "./store.ts";
-import { PLANS, PLAN_LIMIT_CODE, getServicePlan, planStateFromRow, type PlanState } from "./plans.ts";
+import { PLANS, PLAN_LIMIT_CODE, annualProPriceCents, getServicePlan, planStateFromRow, type PlanState } from "./plans.ts";
 import { buildAnalytics, clampDays } from "./analytics.ts";
 import { dashboardHtml } from "./dashboard.ts";
+import {
+  countWatches,
+  createWatch,
+  deleteWatch,
+  deleteWatchesForService,
+  dueWatches,
+  getWatchForService,
+  listWatches,
+  publicWatch,
+  resolveWatchTarget,
+  runCheck,
+  runWatchCron,
+  sendWatchAlert,
+  updateWatch,
+  watchCheckTimeoutMs,
+  watchHistoryDays,
+  watchIntervals,
+  watchMaxPerRun,
+  watchQuota,
+  watchStatus,
+  watchStatusHtml,
+  WATCH_PRO_MAX,
+  type CheckOutcome,
+} from "./watch.ts";
 import {
   createBillingPortal,
   createProCheckout,
@@ -100,7 +127,7 @@ function planLimitError(env: Env, message: string, plan: PlanState): HttpError {
   });
 }
 
-function publicPlan(plan: PlanState) {
+function publicPlan(plan: PlanState, env?: Env) {
   return {
     id: plan.id,
     name: PLANS[plan.id].name,
@@ -110,6 +137,8 @@ function publicPlan(plan: PlanState) {
     currentPeriodEnd: plan.currentPeriodEnd,
     cancelAtPeriodEnd: plan.cancelAtPeriodEnd,
     priceCents: plan.priceCents,
+    billingInterval: plan.billingInterval,
+    annualPriceCents: annualProPriceCents(env ?? {}),
     limits: plan.limits,
   };
 }
@@ -177,7 +206,7 @@ api.get("/api/services/:slug", async (c) => {
   const row = await getServiceBySlug(db(c.env), c.req.param("slug"));
   if (!row || row.status !== "active") return asJson({ error: "service_not_found" }, 404);
   const plan = await getServicePlan(db(c.env), row.id, c.env);
-  return asJson({ service: publicService(row, `${publicBase(c.env)}/g`, publicPlan(plan)) });
+  return asJson({ service: publicService(row, `${publicBase(c.env)}/g`, publicPlan(plan, c.env)) });
 });
 
 /** Register a service: returns the admin key once and auto-lists in x402market. */
@@ -216,7 +245,7 @@ api.post("/api/services", async (c) => {
   // uniqueSlug needs the db; it is defined in store with the same helper name.
   const { uniqueSlug } = await import("./store.ts");
   const slug = await uniqueSlug(db(c.env), slugBase);
-  const row = await createService(db(c.env), input, await sha256Hex(adminKey), slug);
+  const row = await createService(db(c.env), input, await adminHash(c.env, adminKey), slug, c.env);
 
   // Auto-list in the x402market registry. Failures are reported but do not
   // block registration (the owner can relist from the admin endpoint).
@@ -235,6 +264,23 @@ api.post("/api/services", async (c) => {
   });
   await updateService(db(c.env), row, { registry_id: registryId });
   const listing = { ok: true as const, serviceId: registryId };
+
+  // Auto-watch the first paid route so breakage pages the owner from day one.
+  // Best-effort: a watch failure must never fail a registration.
+  const paidRoute = input.routes.find((r) => r.priceSats > 0);
+  if (paidRoute) {
+    try {
+      await createWatch(db(c.env), {
+        serviceId: row.id,
+        label: `${paidRoute.name} (auto)`,
+        targetUrl: `${workersDev}/g/${slug}/${paidRoute.name}`,
+        expect402: true,
+        webhookUrl: "",
+      });
+    } catch (e) {
+      console.error("[watch-autocreate]", slug, e);
+    }
+  }
 
   const base = publicBase(c.env);
   return asJson(
@@ -255,7 +301,7 @@ api.post("/api/services/:slug/admin", async (c) => {
   const slug = c.req.param("slug");
   const adminKey = c.req.header("X-Admin-Key") ?? "";
   if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
-  const row = await requireAdmin(db(c.env), slug, adminKey);
+  const row = await requireAdmin(db(c.env), slug, adminKey, c.env);
   const text = await c.req.text();
   let body: Record<string, unknown> = {};
   try {
@@ -268,15 +314,16 @@ api.post("/api/services/:slug/admin", async (c) => {
   switch (action) {
     case "plan": {
       const plan = await getServicePlan(db(c.env), row.id, c.env);
-      return asJson({ plan: publicPlan(plan) });
+      return asJson({ plan: publicPlan(plan, c.env) });
     }
     case "checkout": {
       const plan = await getServicePlan(db(c.env), row.id, c.env);
       if (plan.active) throw new HttpError(409, "This service is already on Pro — manage it in the billing portal");
-      const checkout = await createProCheckout(c.env, row, publicBase(c.env));
+      const interval = body.interval === "year" ? "year" : "month";
+      const checkout = await createProCheckout(c.env, row, publicBase(c.env), interval);
       return asJson({
         ...checkout,
-        plan: publicPlan(plan),
+        plan: publicPlan(plan, c.env),
         note: "Open this Stripe Checkout URL in a browser to subscribe. Pro activates when the Stripe webhook confirms payment.",
       });
     }
@@ -319,7 +366,7 @@ api.post("/api/services/:slug/admin", async (c) => {
         throw planLimitError(c.env, "Per-call analytics are a Pro feature — upgrade to see the call log.", plan);
       }
       const usage = await listUsage(db(c.env), row.id, Number(body.limit) || 25);
-      return asJson({ service: publicService(row, `${publicBase(c.env)}/g`, publicPlan(plan)), usage });
+      return asJson({ service: publicService(row, `${publicBase(c.env)}/g`, publicPlan(plan, c.env)), usage });
     }
     case "pause":
     case "resume": {
@@ -334,7 +381,7 @@ api.post("/api/services/:slug/admin", async (c) => {
       const fresh = mintAdminKey();
       await db(c.env)
         .prepare("UPDATE xgw_services SET admin_key_hash = ?, updated_at = ? WHERE id = ?")
-        .bind(await sha256Hex(fresh), nowIso(), row.id)
+        .bind(await adminHash(c.env, fresh), nowIso(), row.id)
         .run();
       return asJson({ adminKey: fresh, note: "New admin key issued — the previous one is invalid immediately." });
     }
@@ -373,24 +420,40 @@ api.post("/api/services/:slug/admin", async (c) => {
       if (body.ownerContact !== undefined) patch.owner_contact = cleanStr(body.ownerContact, 160);
       if (body.baseUrl !== undefined) patch.base_url = parseBaseUrl(body.baseUrl);
       if (body.payTo !== undefined) {
-        const validated = validateServiceInput({ ...serviceToInput(row), payTo: body.payTo, routes: routesOf(row) }, maxRoutes);
+        const validated = validateServiceInput(
+          { ...(await serviceToInput(c.env, row)), payTo: body.payTo, routes: routesOf(row) },
+          maxRoutes,
+        );
         patch.pay_to = validated.payTo;
       }
       if (body.authHeader !== undefined || body.authValue !== undefined) {
+        const currentValue = await resolveAuthValue(c.env, row);
         const validated = validateServiceInput(
           {
-            ...serviceToInput(row),
+            ...(await serviceToInput(c.env, row)),
             authHeader: body.authHeader ?? row.auth_header,
-            authValue: body.authValue ?? row.auth_value,
+            authValue: body.authValue ?? currentValue,
             routes: routesOf(row),
           },
           maxRoutes,
         );
         patch.auth_header = validated.authHeader;
-        patch.auth_value = validated.authValue;
+        // Encrypted at rest; plaintext column cleared on migrate.
+        const { encryptAuthValue } = await import("./creds.ts");
+        const enc = validated.authValue ? await encryptAuthValue(c.env, validated.authValue).catch(() => "") : "";
+        if (enc && enc !== validated.authValue) {
+          patch.auth_value_enc = enc;
+          patch.auth_value = "";
+        } else {
+          patch.auth_value = validated.authValue;
+        }
+        await ensureCredsColumn(db(c.env));
       }
       if (body.routes !== undefined) {
-        const validated = validateServiceInput({ ...serviceToInput(row), routes: body.routes }, maxRoutes);
+        const validated = validateServiceInput(
+          { ...(await serviceToInput(c.env, row)), routes: body.routes },
+          maxRoutes,
+        );
         patch.routes_json = JSON.stringify(validated.routes);
       }
       if (Object.keys(patch).length === 0) throw new HttpError(400, "no supported fields or action provided");
@@ -400,7 +463,7 @@ api.post("/api/services/:slug/admin", async (c) => {
   }
 });
 
-function serviceToInput(row: ServiceRow) {
+async function serviceToInput(env: Env, row: ServiceRow) {
   return {
     name: row.name,
     tagline: row.tagline,
@@ -409,7 +472,7 @@ function serviceToInput(row: ServiceRow) {
     payTo: row.pay_to,
     ownerContact: row.owner_contact,
     authHeader: row.auth_header,
-    authValue: row.auth_value,
+    authValue: await resolveAuthValue(env, row),
     routes: routesOf(row),
   };
 }
@@ -418,7 +481,7 @@ function serviceToInput(row: ServiceRow) {
 api.get("/api/services/:slug/usage.csv", async (c) => {
   const adminKey = c.req.header("X-Admin-Key") ?? "";
   if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
-  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey);
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
   const plan = await getServicePlan(db(c.env), row.id, c.env);
   if (!plan.limits.usageLog) {
     throw planLimitError(c.env, "CSV export is a Pro feature — upgrade to export call history.", plan);
@@ -445,7 +508,7 @@ api.get("/api/services/:slug/usage.csv", async (c) => {
 api.get("/api/services/:slug/analytics", async (c) => {
   const adminKey = c.req.header("X-Admin-Key") ?? "";
   if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
-  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey);
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
   const plan = await getServicePlan(db(c.env), row.id, c.env);
   return asJson(await buildAnalytics(db(c.env), row, plan, clampDays(c.req.query("days"))));
 });
@@ -465,8 +528,150 @@ api.get("/api/dashboards/:token/analytics", async (c) => {
 /** Analytics dashboard page (owner key or public token). */
 api.get("/dashboard", (c) => c.html(dashboardHtml(publicBase(c.env))));
 
-/** Stripe webhook: flips services to/from Pro. Signature-verified + deduped. */
-api.post("/webhooks/stripe", async (c) => {
+// ---------- Watch: uptime + 402-validity monitoring ----------
+
+function watchStatusUrl(env: Env, watchId: string): string {
+  return `${publicBase(env)}/watch/${watchId}`;
+}
+
+/** Run a check and alert on transitions when the service is Pro. */
+async function maybeAlertWatch(
+  env: Env,
+  watch: import("./watch.ts").WatchRow,
+  pro: boolean,
+  outcome: CheckOutcome,
+): Promise<CheckOutcome> {
+  if ((outcome.transition || outcome.termsChanged) && pro && watch.paused !== 1) {
+    const svc = watch.service_id ? await getServiceById(db(env), watch.service_id) : null;
+    await sendWatchAlert(db(env), env, outcome.watch, svc, {
+      type:
+        outcome.transition === "recovered"
+          ? "watch.recovered"
+          : outcome.transition === "down"
+            ? "watch.down"
+            : "watch.terms_changed",
+      probe: outcome.probe,
+      statusUrl: watchStatusUrl(env, watch.id),
+    });
+  }
+  return outcome;
+}
+
+async function requireWatch(
+  env: Env,
+  serviceId: string,
+  watchId: string,
+): Promise<import("./watch.ts").WatchRow> {
+  const watch = await getWatchForService(db(env), serviceId, watchId);
+  if (!watch) throw new HttpError(404, "Watch not found for this service");
+  return watch;
+}
+
+/** Create a watch (admin key). Body: {url} or {route}, plus label/expect402/webhookUrl. */
+api.post("/api/services/:slug/watches", async (c) => {
+  const adminKey = c.req.header("X-Admin-Key") ?? "";
+  if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
+  const plan = await getServicePlan(db(c.env), row.id, c.env);
+  const used = await countWatches(db(c.env), row.id);
+  const max = watchQuota(plan.active);
+  if (used >= max) {
+    throw planLimitError(
+      c.env,
+      `This service's ${plan.id} plan allows ${max} monitored endpoint${max === 1 ? "" : "s"} — upgrade to Pro for ${WATCH_PRO_MAX} plus alerts.`,
+      plan,
+    );
+  }
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const workersDev = (c.env.WORKERS_DEV_BASE || new URL(c.req.url).origin).replace(/\/$/, "");
+  const targetUrl = resolveWatchTarget(body, row, workersDev);
+  const watch = await createWatch(db(c.env), {
+    serviceId: row.id,
+    label: cleanStr(body.label, 120),
+    targetUrl,
+    expect402: body.expect402 === undefined ? true : Boolean(body.expect402),
+    webhookUrl: cleanStr(body.webhookUrl, 500),
+  });
+  return asJson({ watch: publicWatch(watch, watchStatusUrl(c.env, watch.id)) }, 201);
+});
+
+/** List watches with quota (admin key). */
+api.get("/api/services/:slug/watches", async (c) => {
+  const adminKey = c.req.header("X-Admin-Key") ?? "";
+  if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
+  const plan = await getServicePlan(db(c.env), row.id, c.env);
+  const watches = await listWatches(db(c.env), row.id);
+  return asJson({
+    watches: watches.map((w) => publicWatch(w, watchStatusUrl(c.env, w.id))),
+    quota: { used: watches.length, max: watchQuota(plan.active), pro: plan.active },
+    alerts: plan.active
+      ? { email: Boolean(c.env.RESEND_API_KEY), webhook: true }
+      : { email: false, webhook: false, note: "Alerts are a Pro feature — upgrade to get paged on breakage." },
+  });
+});
+
+/** Update a watch (admin key). */
+api.patch("/api/services/:slug/watches/:id", async (c) => {
+  const adminKey = c.req.header("X-Admin-Key") ?? "";
+  if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
+  const watch = await requireWatch(c.env, row.id, c.req.param("id"));
+  const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+  const patch: { label?: string; webhookUrl?: string; expect402?: boolean; paused?: boolean } = {};
+  if (body.label !== undefined) patch.label = cleanStr(body.label, 120);
+  if (body.webhookUrl !== undefined) patch.webhookUrl = cleanStr(body.webhookUrl, 500);
+  if (body.expect402 !== undefined) patch.expect402 = Boolean(body.expect402);
+  if (body.paused !== undefined) patch.paused = Boolean(body.paused);
+  const updated = await updateWatch(db(c.env), watch.id, patch);
+  return asJson({ watch: publicWatch(updated, watchStatusUrl(c.env, updated.id)) });
+});
+
+/** Delete a watch (admin key). */
+api.delete("/api/services/:slug/watches/:id", async (c) => {
+  const adminKey = c.req.header("X-Admin-Key") ?? "";
+  if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
+  await requireWatch(c.env, row.id, c.req.param("id"));
+  await deleteWatch(db(c.env), c.req.param("id"));
+  return asJson({ deleted: true });
+});
+
+/** Run a check now (admin key): full pipeline including Pro-gated alerts. */
+api.post("/api/services/:slug/watches/:id/check", async (c) => {
+  const adminKey = c.req.header("X-Admin-Key") ?? "";
+  if (!adminKey) throw new HttpError(401, "X-Admin-Key header is required");
+  const row = await requireAdmin(db(c.env), c.req.param("slug"), adminKey, c.env);
+  const plan = await getServicePlan(db(c.env), row.id, c.env);
+  const watch = await requireWatch(c.env, row.id, c.req.param("id"));
+  const outcome = await runCheck(db(c.env), watch, {
+    timeoutMs: watchCheckTimeoutMs(c.env),
+    historyDays: watchHistoryDays(c.env, plan.active),
+    workersDevBase: (c.env.WORKERS_DEV_BASE || new URL(c.req.url).origin).replace(/\/$/, ""),
+  });
+  await maybeAlertWatch(c.env, outcome.watch, plan.active, outcome);
+  return asJson({
+    watch: publicWatch(outcome.watch, watchStatusUrl(c.env, outcome.watch.id)),
+    transition: outcome.transition,
+    termsChanged: outcome.termsChanged,
+    probe: {
+      ok: outcome.probe.ok,
+      status: outcome.probe.status,
+      latencyMs: outcome.probe.latencyMs,
+      priceSats: outcome.probe.priceSats,
+      error: outcome.probe.error,
+    },
+  });
+});
+
+/** Public status page (unguessable id, noindex). */
+api.get("/watch/:id", async (c) => {
+  const data = await watchStatus(db(c.env), c.req.param("id"), `${publicBase(c.env)}/watch/${c.req.param("id")}`);
+  if (!data) return asJson({ error: "watch_not_found" }, 404);
+  return c.html(watchStatusHtml(publicBase(c.env), data));
+});
+
+/** Stripe webhook: flips services to/from Pro. Signature-verified + deduped. */api.post("/webhooks/stripe", async (c) => {
   const secret = c.env.STRIPE_WEBHOOK_SECRET;
   if (!secret || !stripeConfigured(c.env)) throw new HttpError(503, "Stripe is not configured");
   const signature = c.req.header("stripe-signature");
@@ -613,7 +818,7 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
     const value = c.req.header(name);
     if (value) headers.set(name, value);
   }
-  if (row.auth_header) headers.set(row.auth_header, row.auth_value);
+  if (row.auth_header) headers.set(row.auth_header, await resolveAuthValue(c.env, row));
 
   let requestBody: string | undefined;
   if (c.req.method === "POST") {
@@ -766,7 +971,7 @@ function landingHtml(base: string): string {
     </div>
     <label>Tagline</label><input id="tagline" placeholder="Ten words about it">
     <label>Description</label><textarea id="description" style="min-height:70px" placeholder="What buyers get"></textarea>
-    <label>Routes (JSON array) — Free: up to 5 · Pro: 100 + analytics</label>
+    <label>Routes (JSON array) — Free: up to 5 · Pro: 100 + analytics + uptime monitoring</label>
     <textarea id="routes">[
   { "name": "forecast", "method": "GET", "path": "/v1/forecast", "priceSats": 20, "description": "7-day forecast by city" },
   { "name": "health", "method": "GET", "path": "/healthz", "priceSats": 0, "description": "Free liveness check" }
@@ -777,6 +982,12 @@ function landingHtml(base: string): string {
 
   <h2>Live services</h2>
   <div class="panel"><table id="services"><tbody><tr><td>Loading…</td></tr></tbody></table></div>
+
+  <h2>Uptime monitoring (Watch)</h2>
+  <div class="panel">
+    <p>Every paid route is watched automatically: the gateway probes it like a buyer every 15 minutes and checks the 402 challenge is valid. <strong>Pro</strong> services get email + webhook alerts on breakage, price-change warnings, and a public status page. Free services get daily checks with status in the dashboard.</p>
+    <p>Manage watches from the service admin API (<code>POST /api/services/&lt;slug&gt;/watches</code>) or read the <a href="${base}/docs">docs</a>. Pro is <strong>$9/mo or $86.40/yr</strong>.</p>
+  </div>
 </div>
 <script>
 const $ = (id) => document.getElementById(id);
@@ -821,16 +1032,17 @@ $('submit').addEventListener('click', async () => {
       '<p>Gateway base: <code>' + esc(data.gatewayBase) + '</code></p>' +
       '<p>Plan: <strong>Free</strong> · up to 5 routes · ' +
       '<button id="upgradeBtn" class="ghostBtn">Upgrade to Pro — $9/mo</button> ' +
+      '<button id="upgradeAnnualBtn" class="ghostBtn">Pro annual — $86.40/yr</button> ' +
       '<a class="ghostBtn" style="text-decoration:none" href="' + esc(data.dashboard || '#') + '">Open dashboard</a></p>' +
       '<p>Store this admin key now (shown once):</p><pre>' + esc(data.adminKey) + '</pre>';
-    document.getElementById('upgradeBtn').onclick = async () => {
-      const btn = document.getElementById('upgradeBtn');
+    const startCheckout = async (btnId, interval) => {
+      const btn = document.getElementById(btnId);
       btn.disabled = true;
       try {
         const r = await fetch('${base}/api/services/' + encodeURIComponent(data.service.slug) + '/admin', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-Admin-Key': data.adminKey },
-          body: JSON.stringify({ action: 'checkout' }),
+          body: JSON.stringify({ action: 'checkout', interval }),
         });
         const j = await r.json();
         if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
@@ -840,6 +1052,8 @@ $('submit').addEventListener('click', async () => {
         alert('Upgrade error: ' + e.message);
       }
     };
+    document.getElementById('upgradeBtn').onclick = () => startCheckout('upgradeBtn', 'month');
+    document.getElementById('upgradeAnnualBtn').onclick = () => startCheckout('upgradeAnnualBtn', 'year');
     load();
   } catch (e) {
     out.style.display = 'block';
@@ -877,4 +1091,11 @@ const app = new Hono<{ Bindings: Env }>({ strict: false });
 app.route("/", api);
 app.route("/x402gateway", api);
 
-export default app;
+export default {
+  fetch: app.fetch.bind(app),
+  // Cron tick (every 15 min): check due watches, alert on transitions, prune history.
+  scheduled: async (_event: unknown, env: Env, _ctx: unknown) => {
+    const result = await runWatchCron(env, { publicBase: publicBase(env) });
+    console.log(`[watch-cron] checked=${result.checked} alerted=${result.alerted} errors=${result.errors}`);
+  },
+};

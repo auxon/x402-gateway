@@ -85,7 +85,7 @@ const ctx = {
 };
 
 function makeCall(env) {
-  return (path, init = {}) => app.request(`https://gw.test${path}`, init, env, ctx);
+  return (path, init = {}) => app.fetch(new Request(`https://gw.test${path}`, init), env, ctx);
 }
 
 // ---------- fetch stubs ----------

@@ -10,6 +10,7 @@
     { "pattern": "entangleit.com/x402gateway", "zone_name": "entangleit.com" },
     { "pattern": "entangleit.com/x402gateway/*", "zone_name": "entangleit.com" }
   ],
+  "triggers": { "crons": ["*/15 * * * *"] },
   "d1_databases": [{ "binding": "DB", "database_name": "entangleit", "database_id": "8f6c1ac7-ab0c-4133-a037-6ac1ed6afa6e" }],
   "kv_namespaces": [{ "binding": "METER", "id": "5e067a7e5a504fc88c167c4a8db729ab" }],
   "vars": {
@@ -24,5 +25,8 @@
     "MAX_REQUEST_BYTES": "65536",
     "RATE_LIMIT_PER_MIN": "60"
   },
+  // Secrets (wrangler secret put):
+  //   GATEWAY_CREDS_KEY  base64 32-byte AES-GCM key for upstream auth secrets.
+  //   ADMIN_SECRET       pepper for admin-key hashes (dual-check migrates).
   "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

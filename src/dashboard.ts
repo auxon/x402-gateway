@@ -99,9 +99,13 @@ export function dashboardHtml(base: string): string {
       <div id="sharePanel"></div>
     </div>
 
+    <h2>Uptime</h2>
+    <div class="panel" id="watchPanel" style="overflow-x:auto"><span class="muted">Loading…</span></div>
+
     <div id="locked" class="lock" style="margin-top:22px; display:none">
-      Per-day charts, the route breakdown, and the call log are <strong>Pro</strong> features.<br>
-      <button class="ghost" id="upgrade" style="margin-top:12px">Upgrade to Pro — $9/mo</button>
+      Per-day charts, the route breakdown, the call log, and uptime alerts are <strong>Pro</strong> features.<br>
+      <button class="ghost" id="upgradeMonthly" style="margin-top:12px">Upgrade to Pro — monthly</button>
+      <button class="ghost" id="upgradeAnnual" style="margin-top:12px">Upgrade to Pro — annual, save 20%</button>
     </div>
   </div>
 </div>
@@ -177,6 +181,26 @@ async function load(showError = true) {
       statCard('Calls', fmt(d.totals.calls), fmt(d.totals.paidCalls) + ' paid · ' + fmt(d.totals.freeCalls) + ' free') +
       statCard('Sats earned', fmt(d.totals.sats), 'settled to the service payTo') +
       statCard('Success rate', d.totals.successRate === null ? '—' : d.totals.successRate + '%', fmt(d.totals.errors) + ' errors');
+
+    const dot = (s) => s === 'ok'
+      ? '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#6ee7b7"></span>'
+      : s === 'failing'
+        ? '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#f87171"></span>'
+        : '<span style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#8b97ab"></span>';
+    const watches = (d.watch && d.watch.watches) || [];
+    $('watchPanel').innerHTML = watches.length === 0
+      ? '<span class="muted">No endpoints monitored yet. Owners add watches from the service admin API; paid routes are watched automatically.</span>'
+      : '<table><thead><tr><th></th><th>Endpoint</th><th>Status</th><th class="num">HTTP</th><th class="num">ms</th><th class="num">Sats</th><th>Last checked (UTC)</th></tr></thead><tbody>' +
+        watches.map((w) =>
+          '<tr><td>' + dot(w.status) + '</td><td><a class="mono" href="' + BASE + '/watch/' + encodeURIComponent(w.id) + '" target="_blank" rel="noreferrer">' + esc(w.label || w.targetUrl) + '</a>' +
+          '<div class="muted mono" style="font-size:11px">' + esc(w.targetUrl) + '</div></td>' +
+          '<td>' + esc(w.status) + (w.consecutiveFailures > 1 ? ' ×' + w.consecutiveFailures : '') + '</td>' +
+          '<td class="num">' + (w.lastStatus === null || w.lastStatus === undefined ? '—' : w.lastStatus) + '</td>' +
+          '<td class="num">' + (w.lastLatencyMs === null || w.lastLatencyMs === undefined ? '—' : w.lastLatencyMs) + '</td>' +
+          '<td class="num">' + (w.lastPriceSats === null || w.lastPriceSats === undefined ? '—' : fmt(w.lastPriceSats)) + '</td>' +
+          '<td class="mono">' + (w.lastCheckedAt ? esc(w.lastCheckedAt.slice(0, 19).replace('T', ' ')) : 'never') + '</td></tr>'
+        ).join('') + '</tbody></table>' +
+        (d.pro ? '' : '<div class="muted" style="margin-top:10px">Email + webhook alerts on breakage are Pro — upgrade to get paged.</div>');
 
     $('proCharts').style.display = d.pro ? 'block' : 'none';
     $('locked').style.display = d.pro ? 'none' : 'block';
@@ -263,13 +287,13 @@ async function shareAction(slug, action) {
   }
 }
 
-async function upgrade() {
+async function upgrade(interval) {
   const slug = params.get('service') || $('slug').value.trim();
   try {
     const res = await api('/api/services/' + encodeURIComponent(slug) + '/admin', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Admin-Key': keyFor(slug) },
-      body: JSON.stringify({ action: 'checkout' }),
+      body: JSON.stringify({ action: 'checkout', interval }),
     });
     window.location.href = res.url;
   } catch (e) {
@@ -281,7 +305,8 @@ $('open').onclick = () => { load(); };
 $('refresh').onclick = () => load();
 $('days').onchange = () => load();
 $('key').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
-$('upgrade').onclick = () => upgrade();
+$('upgradeMonthly').onclick = () => upgrade('month');
+$('upgradeAnnual').onclick = () => upgrade('year');
 
 if (params.get('service') || token) load(); else $('auth').style.display = 'block';
 </script>

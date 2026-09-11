@@ -86,17 +86,21 @@ directory.
 
 ## Hosting tiers
 
-Every service starts on **Free**; **Pro ($9/mo)** is a Stripe subscription
+Every service starts on **Free**; **Pro ($9/mo, or $86.40/yr)** is a Stripe subscription
 (`PRO_PRICE_CENTS` overrides the price, `STRIPE_PRICE_GATEWAY_PRO` pins a
-pre-created recurring Price). Entitlements come from `xgw_subscriptions`, which
-only verified Stripe webhooks write.
+pre-created recurring Price, `STRIPE_PRICE_GATEWAY_PRO_ANNUAL` pins the annual one).
+`{"action":"checkout"}` accepts `{"interval":"year"}` for annual; the plan endpoint
+reports `billingInterval`. Entitlements come from `xgw_subscriptions`, which
+only verified Stripe webhooks write. Failed renewals (`invoice.payment_failed`)
+keep Pro until the period ends, then lapse.
 
-| | Free | Pro ($9/mo) |
+| | Free | Pro ($9/mo · $86.40/yr) |
 | --- | --- | --- |
 | Routes per service | 5 | 100 |
 | Aggregate calls/sats totals | yes | yes |
 | Per-call analytics log | — | yes |
 | CSV export of calls | — | yes |
+| Uptime monitoring (Watch) | 1 endpoint, daily, no alerts | 10 endpoints, 15-min checks, email + webhook alerts |
 | Listed in x402market | yes | yes |
 
 Owner flow (admin key required):
@@ -126,6 +130,8 @@ npx wrangler secret put STRIPE_SECRET_KEY       # restricted key: Checkout (writ
                                                 # Customers (write), Subscriptions (write),
                                                 # Billing Portal (write). Live key on prod.
 npx wrangler secret put STRIPE_WEBHOOK_SECRET   # signing secret of the endpoint below
+npx wrangler secret put RESEND_API_KEY          # optional: Watch alert emails
+                                                # (alerts@entangleit.com sender by default)
 ```
 
 Webhook endpoint: `https://entangleit.com/x402gateway/webhooks/stripe` with events
@@ -150,6 +156,33 @@ and deduped (`xgw_stripe_events`).
 
 API: `GET /api/services/:slug/analytics?days=7|30|90` (admin key) and
 `GET /api/dashboards/:token/analytics?days=` (public token).
+
+## Uptime monitoring (Watch)
+
+Every paid route is auto-watched on registration. The gateway probes each
+watched endpoint like a buyer would — unsigned GET, expect a valid 402
+challenge — on a 15-minute cron tick (Pro) or daily (Free), and records price,
+payTo, latency, and failures.
+
+```bash
+# list watches (admin key) — includes quota and alert channels
+curl -s https://entangleit.com/x402gateway/api/services/<slug>/watches \
+  -H 'X-Admin-Key: …'
+# add one: your own route shorthand or any https URL
+curl -s -X POST https://entangleit.com/x402gateway/api/services/<slug>/watches \
+  -H 'X-Admin-Key: …' -H 'content-type: application/json' \
+  -d '{"route":"forecast","label":"prod forecast","webhookUrl":"https://example.com/hook"}'
+# check now (runs the full pipeline, Pro-gated alerts)
+curl -s -X POST https://entangleit.com/x402gateway/api/services/<slug>/watches/<id>/check \
+  -H 'X-Admin-Key: …'
+```
+
+State changes alert once (`watch.down`, `watch.recovered`); price/payTo moves
+against the observed baseline raise `watch.terms_changed`. Alerts go to the
+owner email from registration (needs `RESEND_API_KEY`) and/or the watch's
+`webhookUrl` as JSON. Each watch has a public status page at
+`/x402gateway/watch/<id>` (unguessable id, `noindex`). Free watches get status
+without alerts; Pro unlocks alerts, 10 endpoints, and 90-day history.
 
 ## Security model
 

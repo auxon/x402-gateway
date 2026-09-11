@@ -64,7 +64,7 @@ function testEnv(db, overrides = {}) {
 
 const ctx = { waitUntil() {}, passThroughOnException() {} };
 function makeCall(env) {
-  return (path, init = {}) => app.request(`https://gw.test${path}`, init, env, ctx);
+  return (path, init = {}) => app.fetch(new Request(`https://gw.test${path}`, init), env, ctx);
 }
 
 function installFetchStub() {
@@ -305,7 +305,16 @@ describe("stripe subscription webhooks", () => {
     );
     const plan = await getServicePlan(db, id, env);
     assert.equal(plan.status, "past_due");
-    assert.equal(plan.id, "free");
+    // Dunning grace: past_due keeps Pro until the period ends.
+    assert.equal(plan.id, "pro");
+    assert.equal(plan.active, true);
+
+    db.raw.prepare("UPDATE xgw_subscriptions SET current_period_end = ? WHERE service_id = ?").run(
+      new Date(Date.now() - 3600 * 1000).toISOString(), id);
+    const lapsed = await getServicePlan(db, id, env);
+    assert.equal(lapsed.status, "past_due");
+    assert.equal(lapsed.id, "free");
+    assert.equal(lapsed.active, false);
   });
 
   it("creates a minimal row from checkout.session.completed", async () => {

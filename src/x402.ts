@@ -43,14 +43,34 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   /** Optional pre-created recurring price for Gateway Pro. */
   STRIPE_PRICE_GATEWAY_PRO?: string;
+  /** Optional pre-created recurring ANNUAL price for Gateway Pro. */
+  STRIPE_PRICE_GATEWAY_PRO_ANNUAL?: string;
   /** Monthly Gateway Pro price in USD cents (default 900 = $9). */
   PRO_PRICE_CENTS?: string;
+  /** Resend API key for Watch alert emails (optional — webhooks still work). */
+  RESEND_API_KEY?: string;
+  /** From header for Watch alert emails. */
+  WATCH_ALERT_FROM?: string;
+  /** Watch tuning knobs (all have code defaults): check intervals in minutes. */
+  WATCH_FREE_INTERVAL_MIN?: string;
+  WATCH_PRO_INTERVAL_MIN?: string;
+  /** Max watches checked per cron tick (default 50). */
+  WATCH_MAX_PER_RUN?: string;
+  /** Check-history retention in days (defaults: 7 free, 90 pro). */
+  WATCH_FREE_HISTORY_DAYS?: string;
+  WATCH_PRO_HISTORY_DAYS?: string;
+  /** Per-probe timeout in ms (default 10000). */
+  WATCH_CHECK_TIMEOUT_MS?: string;
   MAX_ROUTES_PER_SERVICE?: string;
   MAX_SERVICES_PER_IP_PER_DAY?: string;
   UPSTREAM_TIMEOUT_MS?: string;
   MAX_RESPONSE_BYTES?: string;
   MAX_REQUEST_BYTES?: string;
   RATE_LIMIT_PER_MIN?: string;
+  /** Base64 32-byte AES-GCM key encrypting upstream auth secrets at rest. */
+  GATEWAY_CREDS_KEY?: string;
+  /** Pepper for admin-key hashes (dual-check accepts legacy unpeppered). */
+  ADMIN_SECRET?: string;
 }
 
 const te = new TextEncoder();

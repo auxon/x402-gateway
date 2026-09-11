@@ -1,10 +1,12 @@
 /**
  * Gateway store: validation, slugs, D1 helpers, and the SSRF guard.
- * Upstream credentials are stored server-side (needed to sign requests) and
- * never returned by any API after creation.
+ * Upstream credentials are AES-GCM encrypted at rest (auth_value_enc) and
+ * never returned by any API after creation. Legacy plaintext auth_value
+ * rows decrypt by passthrough and migrate on next admin write.
  */
 import { P2PKH } from "@bsv/sdk";
 import type { Env } from "./x402.ts";
+import { decryptAuthValue, encryptAuthValue } from "./creds.ts";
 
 export class HttpError extends Error {
   status: number;
@@ -36,6 +38,8 @@ export interface ServiceRow {
   base_url: string;
   auth_header: string;
   auth_value: string;
+  /** AES-GCM envelope when GATEWAY_CREDS_KEY was set at write time. */
+  auth_value_enc?: string | null;
   pay_to: string;
   owner_contact: string;
   admin_key_hash: string;
@@ -276,6 +280,24 @@ export function db(env: Env): D1Like {
   return env.DB as D1Like;
 }
 
+/** Runtime ensure for pre-migration DBs (schema.sql covers fresh installs). */
+export async function ensureCredsColumn(database: D1Like): Promise<void> {
+  await database.prepare("ALTER TABLE xgw_services ADD COLUMN auth_value_enc TEXT").run().catch(() => {});
+}
+
+/** Plaintext credential for upstream injection. Prefers the encrypted column. */
+export async function resolveAuthValue(env: Env, row: ServiceRow): Promise<string> {
+  const enc = (row as ServiceRow).auth_value_enc;
+  if (typeof enc === "string" && enc.length > 0) return decryptAuthValue(env, enc);
+  return row.auth_value ?? "";
+}
+
+/** Peppered admin hash (ADMIN_SECRET); empty pepper = legacy hash. */
+export async function adminHash(env: Env | undefined, key: string): Promise<string> {
+  const pepper = typeof env?.ADMIN_SECRET === "string" ? env.ADMIN_SECRET : "";
+  return sha256Hex(key + pepper);
+}
+
 export async function getServiceBySlug(database: D1Like, slug: string): Promise<ServiceRow | null> {
   return database.prepare("SELECT * FROM xgw_services WHERE slug = ?").bind(slug).first<ServiceRow>();
 }
@@ -307,13 +329,23 @@ export async function createService(
   input: ServiceInput,
   adminKeyHash: string,
   slug: string,
+  env?: Env,
 ): Promise<ServiceRow> {
   const id = newId("xgw");
   const t = nowIso();
+  await ensureCredsColumn(database);
+  await ensureCredsColumn(database);
+  let enc = "";
+  try {
+    if (env) enc = input.authValue ? await encryptAuthValue(env, input.authValue) : "";
+  } catch {
+    enc = "";
+  }
+  const storePlain = enc ? "" : (input.authValue ?? "");
   await database
     .prepare(
-      `INSERT INTO xgw_services (id, slug, name, tagline, description, base_url, auth_header, auth_value, pay_to, owner_contact, admin_key_hash, status, routes_json, registry_id, total_calls, total_sats, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, '', 0, 0, ?, ?)`,
+      `INSERT INTO xgw_services (id, slug, name, tagline, description, base_url, auth_header, auth_value, auth_value_enc, pay_to, owner_contact, admin_key_hash, status, routes_json, registry_id, total_calls, total_sats, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, '', 0, 0, ?, ?)`,
     )
     .bind(
       id,
@@ -323,7 +355,8 @@ export async function createService(
       input.description,
       input.baseUrl,
       input.authHeader,
-      input.authValue,
+      storePlain,
+      enc,
       input.payTo,
       input.ownerContact,
       adminKeyHash,
@@ -337,18 +370,27 @@ export async function createService(
   return row;
 }
 
-export async function requireAdmin(database: D1Like, slug: string, adminKey: string): Promise<ServiceRow> {
+export async function requireAdmin(
+  database: D1Like,
+  slug: string,
+  adminKey: string,
+  env?: Env,
+): Promise<ServiceRow> {
   const row = await getServiceBySlug(database, slug);
   if (!row) throw new HttpError(404, "Service not found");
-  const hash = await sha256Hex(adminKey);
-  if (hash !== row.admin_key_hash) throw new HttpError(403, "Invalid admin key");
+  // Dual-check: peppered (new) or legacy unpeppered — avoids lockout on rollout.
+  const fresh = await adminHash(env, adminKey);
+  const legacy = await sha256Hex(adminKey);
+  if (fresh !== row.admin_key_hash && legacy !== row.admin_key_hash) {
+    throw new HttpError(403, "Invalid admin key");
+  }
   return row;
 }
 
 export async function updateService(
   database: D1Like,
   row: ServiceRow,
-  patch: Partial<Pick<ServiceRow, "name" | "tagline" | "description" | "status" | "owner_contact" | "registry_id" | "auth_header" | "auth_value" | "pay_to" | "base_url" | "routes_json">>,
+  patch: Partial<Pick<ServiceRow, "name" | "tagline" | "description" | "status" | "owner_contact" | "registry_id" | "auth_header" | "auth_value" | "auth_value_enc" | "pay_to" | "base_url" | "routes_json">>,
 ): Promise<ServiceRow> {
   const fields: string[] = [];
   const values: unknown[] = [];
@@ -368,6 +410,11 @@ export async function updateService(
 }
 
 export async function deleteService(database: D1Like, id: string): Promise<void> {
+  await database
+    .prepare("DELETE FROM xgw_watch_checks WHERE watch_id IN (SELECT id FROM xgw_watches WHERE service_id = ?)")
+    .bind(id)
+    .run();
+  await database.prepare("DELETE FROM xgw_watches WHERE service_id = ?").bind(id).run();
   await database.prepare("DELETE FROM xgw_services WHERE id = ?").bind(id).run();
 }
 

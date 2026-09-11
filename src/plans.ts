@@ -37,7 +37,7 @@ export const PLANS: Record<PlanId, PlanDefinition> = {
     id: "pro",
     name: "Pro",
     priceCents: 900,
-    features: ["Up to 100 routes", "Per-call analytics log", "CSV export of calls", "Everything in Free"],
+    features: ["Up to 100 routes", "Per-call analytics log", "CSV export of calls", "Uptime monitoring with email + webhook alerts", "Everything in Free"],
     limits: { maxRoutes: 100, usageLog: true },
   },
 };
@@ -50,6 +50,11 @@ export function proPriceCents(env: Pick<Env, "PRO_PRICE_CENTS">): number {
   return Number.isFinite(n) && n >= 100 ? n : PLANS.pro.priceCents;
 }
 
+/** Annual Pro at 20% off, rounded to the cent. */
+export function annualProPriceCents(env: Pick<Env, "PRO_PRICE_CENTS">): number {
+  return Math.round(proPriceCents(env) * 12 * 0.8);
+}
+
 export interface SubscriptionRow {
   service_id: string;
   plan: string;
@@ -58,9 +63,12 @@ export interface SubscriptionRow {
   stripe_subscription_id: string | null;
   current_period_end: string | null;
   cancel_at_period_end: number;
+  billing_interval: string | null;
   created_at: string;
   updated_at: string;
 }
+
+export type BillingInterval = "month" | "year";
 
 export interface PlanState {
   id: PlanId;
@@ -70,6 +78,7 @@ export interface PlanState {
   currentPeriodEnd: string | null;
   cancelAtPeriodEnd: boolean;
   priceCents: number;
+  billingInterval: BillingInterval;
   limits: PlanLimits;
 }
 
@@ -88,10 +97,13 @@ export function subscriptionIsActive(
   now = Date.now(),
 ): boolean {
   const s = (status ?? "").toLowerCase();
-  if (s !== "active" && s !== "trialing") return false;
-  if (!currentPeriodEnd) return true;
+  if (s !== "active" && s !== "trialing" && s !== "past_due") return false;
+  if (!currentPeriodEnd) return s !== "past_due";
   const end = Date.parse(currentPeriodEnd);
-  return Number.isNaN(end) ? true : end + PRO_GRACE_MS > now;
+  if (Number.isNaN(end)) return s !== "past_due";
+  // past_due keeps Pro until the period ends (dunning grace) instead of
+  // dropping to Free on the first failed retry.
+  return end + (s === "past_due" ? 0 : PRO_GRACE_MS) > now;
 }
 
 export function planStateFromRow(
@@ -109,6 +121,7 @@ export function planStateFromRow(
     currentPeriodEnd: row?.current_period_end ?? null,
     cancelAtPeriodEnd: Boolean(row?.cancel_at_period_end),
     priceCents: proPriceCents(env ?? {}),
+    billingInterval: row?.billing_interval === "year" ? "year" : "month",
     limits: PLANS[id].limits,
   };
 }
@@ -138,13 +151,14 @@ export async function upsertSubscription(
     stripeSubscriptionId?: string | null;
     currentPeriodEnd?: string | null;
     cancelAtPeriodEnd?: boolean;
+    billingInterval?: BillingInterval | null;
   },
 ): Promise<void> {
   const t = new Date().toISOString();
   await database
     .prepare(
-      `INSERT INTO xgw_subscriptions (service_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, cancel_at_period_end, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO xgw_subscriptions (service_id, plan, status, stripe_customer_id, stripe_subscription_id, current_period_end, cancel_at_period_end, billing_interval, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT(service_id) DO UPDATE SET
          plan = excluded.plan,
          status = excluded.status,
@@ -152,6 +166,7 @@ export async function upsertSubscription(
          stripe_subscription_id = COALESCE(excluded.stripe_subscription_id, xgw_subscriptions.stripe_subscription_id),
          current_period_end = COALESCE(excluded.current_period_end, xgw_subscriptions.current_period_end),
          cancel_at_period_end = excluded.cancel_at_period_end,
+         billing_interval = COALESCE(excluded.billing_interval, xgw_subscriptions.billing_interval),
          updated_at = excluded.updated_at`,
     )
     .bind(
@@ -162,6 +177,7 @@ export async function upsertSubscription(
       input.stripeSubscriptionId ?? null,
       input.currentPeriodEnd ?? null,
       input.cancelAtPeriodEnd ? 1 : 0,
+      input.billingInterval ?? null,
       t,
       t,
     )
