@@ -285,6 +285,6 @@ $('upgrade').onclick = () => upgrade();
 
 if (params.get('service') || token) load(); else $('auth').style.display = 'block';
 </script>
-<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"6aa1d203373146758b3bb8a772c9a604"}'></script>
+<script defer src="https://static.cloudflareinsights.com/beacon.min.js" data-cf-beacon='{"token":"82070152b02a4a06a05d7ac15991ed63"}'></script>
 </body></html>`;
 }
