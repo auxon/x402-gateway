@@ -16,6 +16,7 @@ export interface ServiceAnalytics {
   totals: {
     calls: number;
     sats: number;
+    discountSats: number;
     paidCalls: number;
     freeCalls: number;
     errors: number;
@@ -87,9 +88,16 @@ export async function buildAnalytics(
     )
     .bind(row.id, since)
     .first<{ calls: number; sats: number; paid_calls: number; errors: number }>();
+  // discount_sats is additive (ALTER on first discounted write); missing column => 0.
+  const discountRow = await database
+    .prepare(`SELECT COALESCE(SUM(discount_sats), 0) AS d FROM xgw_usage WHERE service_id = ? AND created_at >= ?`)
+    .bind(row.id, since)
+    .first<{ d: number }>()
+    .catch(() => ({ d: 0 }));
 
   const calls = Number(totalsRow?.calls ?? 0);
   const sats = Number(totalsRow?.sats ?? 0);
+  const discountSats = Number(discountRow?.d ?? 0);
   const paidCalls = Number(totalsRow?.paid_calls ?? 0);
   const errors = Number(totalsRow?.errors ?? 0);
 
@@ -101,6 +109,7 @@ export async function buildAnalytics(
     totals: {
       calls,
       sats,
+      discountSats,
       paidCalls,
       freeCalls: calls - paidCalls,
       errors,

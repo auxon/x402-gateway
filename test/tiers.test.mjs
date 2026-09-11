@@ -235,7 +235,7 @@ describe("tier enforcement", () => {
     const csv = await req("/api/services/tier-test/usage.csv", { headers: { "X-Admin-Key": key } });
     assert.equal(csv.status, 200);
     assert.match(csv.headers.get("content-type") ?? "", /text\/csv/);
-    assert.match(await csv.text(), /created_at,route,payer,sats,txid,status,ms/);
+    assert.match(await csv.text(), /created_at,route,payer,sats,discount_sats,txid,status,ms/);
   });
 
   it("rejects checkout when Stripe is not configured", async () => {
@@ -383,7 +383,7 @@ describe("analytics dashboard", () => {
     assert.equal(res.status, 200);
     const d = await res.json();
     assert.equal(d.pro, false);
-    assert.deepEqual(d.totals, { calls: 3, sats: 10, paidCalls: 2, freeCalls: 1, errors: 1, successRate: 66.7 });
+    assert.deepEqual(d.totals, { calls: 3, sats: 10, discountSats: 0, paidCalls: 2, freeCalls: 1, errors: 1, successRate: 66.7 });
     assert.deepEqual(d.byRoute, []);
     assert.deepEqual(d.recent, []);
 

@@ -492,8 +492,8 @@ api.get("/api/services/:slug/usage.csv", async (c) => {
     return /[",\n\r]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
   };
   const rows = [
-    ["created_at", "route", "payer", "sats", "txid", "status", "ms"],
-    ...usage.map((u) => [u.created_at, u.route, u.payer, u.sats, u.txid, u.status, u.ms]),
+    ["created_at", "route", "payer", "sats", "discount_sats", "txid", "status", "ms"],
+    ...usage.map((u) => [u.created_at, u.route, u.payer, u.sats, (u as { discount_sats?: number }).discount_sats ?? 0, u.txid, u.status, u.ms]),
   ];
   const csv = `${rows.map((r) => r.map(esc).join(",")).join("\r\n")}\r\n`;
   return new Response(csv, {
@@ -690,7 +690,7 @@ api.get("/watch/:id", async (c) => {
 
 // ---------- manifest + proxy ----------
 
-function manifestFor(env: Env, row: ServiceRow, origin: string) {
+export function manifestFor(env: Env, row: ServiceRow, origin: string) {
   const routes = routesOf(row);
   return {
     name: row.name,
@@ -706,6 +706,8 @@ function manifestFor(env: Env, row: ServiceRow, origin: string) {
       priceSats: r.priceSats,
       paid: r.priceSats > 0,
       description: r.description,
+      trustAccepted: (r.trustDiscountBps ?? 0) > 0,
+      trustDiscountBps: r.trustDiscountBps ?? 0,
     })),
   };
 }
@@ -739,20 +741,52 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   const price = route.priceSats;
   const signature = c.req.header("PAYMENT-SIGNATURE");
 
+  // Seller-enforced trust discount: a valid agentpay attestation lowers the
+  // challenged price. Binding to the payer is enforced at settle time,
+  // before broadcast — a replayed attestation fails without moving funds.
+  const { TRUST_HEADER, discountSats, verifyTrustForDiscount } = await import("./trust.ts");
+  const trustRaw = c.req.header(TRUST_HEADER) ?? undefined;
+  const routeDiscountBps = Math.min(10_000, Math.max(0, Math.floor(route.trustDiscountBps ?? 0)));
+  const trustQuote = routeDiscountBps > 0 ? await verifyTrustForDiscount(c.env, trustRaw, null) : { eligible: false, reason: "no_discount" };
+  let effPrice = price;
+  let trustApplied = false;
+  if (routeDiscountBps > 0 && trustQuote.eligible) {
+    const discounted = discountSats(price, routeDiscountBps);
+    if (discounted < price) {
+      effPrice = discounted;
+      trustApplied = true;
+    }
+  }
+  const trustDiscount = {
+    bps: routeDiscountBps,
+    applied: trustApplied,
+    reason: trustQuote.reason,
+    priceSats: price,
+    chargedSats: effPrice,
+  };
+
   let paidAmount = 0;
   let payer = "";
   let txid = "";
-  if (price > 0) {
+  if (effPrice > 0) {
     const requirements = buildRequirements({
       url: publicUrl,
       description: `${row.name}/${route.name}: ${route.description || "paid call"}`,
-      satoshis: price,
+      satoshis: effPrice,
       payTo: row.pay_to,
       arcUrl: c.env.ARC_URL || "https://arc.gorillapool.io/v1",
     });
     if (!signature) {
       return asJson(
-        { error: "payment_required", priceSats: price, payTo: row.pay_to, network: BSV_NETWORK, resource: publicUrl },
+        {
+          error: "payment_required",
+          priceSats: effPrice,
+          fullPriceSats: price,
+          trustDiscount,
+          payTo: row.pay_to,
+          network: BSV_NETWORK,
+          resource: publicUrl,
+        },
         402,
         { "PAYMENT-REQUIRED": b64encodeJson(requirements) },
       );
@@ -765,6 +799,12 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
     }
     const verified = await verifyBsvPayment(requirements, payload);
     if (!verified.success) return asJson({ ...verified, network: BSV_NETWORK }, 402);
+    if (trustApplied) {
+      const recheck = await verifyTrustForDiscount(c.env, trustRaw, verified.payer);
+      if (!recheck.eligible) {
+        return asJson({ success: false, errorReason: "trust_failed", detail: recheck.reason, network: BSV_NETWORK }, 402);
+      }
+    }
     let receiptTxid = verified.txid;
     try {
       const broadcast = await arcBroadcast(c.env, verified.txHex);
@@ -782,10 +822,11 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
     if (!(await claimPaymentTxid(c.env, verified.txid))) {
       return asJson({ success: false, errorReason: "payment_already_used", network: BSV_NETWORK }, 402);
     }
-    paidAmount = price;
+    paidAmount = effPrice;
     payer = verified.payer;
     txid = receiptTxid;
   }
+  const discountSatsCharged = trustApplied ? price - effPrice : 0;
 
   // Forward upstream with the seller's credentials; never the caller's.
   // `{param}` placeholders in the route path are filled from query parameters
@@ -843,13 +884,13 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
   } catch (e) {
     const detail = String((e as Error)?.message ?? e).slice(0, 200);
     c.executionCtx.waitUntil(
-      recordUsage(db(c.env), { serviceId: row.id, route: route.name, payer, sats: paidAmount, txid, status: 502, ms: Date.now() - started }),
+      recordUsage(db(c.env), { serviceId: row.id, route: route.name, payer, sats: paidAmount, discountSats: discountSatsCharged, txid, status: 502, ms: Date.now() - started }),
     );
     return asJson({ error: "upstream_failed", detail, charged: paidAmount > 0 }, 502);
   }
   if (upstream.status >= 300 && upstream.status < 400) {
     c.executionCtx.waitUntil(
-      recordUsage(db(c.env), { serviceId: row.id, route: route.name, payer, sats: paidAmount, txid, status: 502, ms: Date.now() - started }),
+      recordUsage(db(c.env), { serviceId: row.id, route: route.name, payer, sats: paidAmount, discountSats: discountSatsCharged, txid, status: 502, ms: Date.now() - started }),
     );
     return asJson({ error: "upstream_redirect_blocked", status: upstream.status, charged: paidAmount > 0 }, 502);
   }
@@ -864,6 +905,7 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
       route: route.name,
       payer,
       sats: paidAmount,
+      discountSats: discountSatsCharged,
       txid,
       status: upstream.status,
       ms: Date.now() - started,
@@ -880,6 +922,7 @@ async function proxyRoute(c: Context<{ Bindings: Env }>): Promise<Response> {
       payer,
       transaction: txid,
       network: BSV_NETWORK,
+      trustDiscount: discountSatsCharged > 0 ? { discountSats: discountSatsCharged, chargedSats: paidAmount } : null,
     });
   }
   return new Response(body, { status: upstream.status, headers: responseHeaders });

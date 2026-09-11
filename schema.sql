@@ -123,3 +123,5 @@ ALTER TABLE xgw_subscriptions ADD COLUMN billing_interval TEXT;
 -- Credential encryption (GATEWAY_CREDS_KEY, AES-GCM envelope). Pre-key rows
 -- keep plaintext auth_value and migrate on next admin write.
 ALTER TABLE xgw_services ADD COLUMN auth_value_enc TEXT;
+-- Trust-discount accounting per settled call.
+ALTER TABLE xgw_usage ADD COLUMN discount_sats INTEGER NOT NULL DEFAULT 0;

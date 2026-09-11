@@ -27,6 +27,8 @@ export interface GatewayRoute {
   path: string;
   priceSats: number;
   description: string;
+  /** Trust discount in bps (0–10000) for verified agentpay spenders. */
+  trustDiscountBps?: number;
 }
 
 export interface ServiceRow {
@@ -219,12 +221,18 @@ export function validateServiceInput(raw: unknown, maxRoutes: number): ServiceIn
     if (!Number.isInteger(priceSats) || priceSats < 0 || priceSats > MAX_PRICE_SATS) {
       throw new HttpError(400, `route "${routeName}" priceSats must be 0..${MAX_PRICE_SATS}`);
     }
+    const trustDiscountBpsRaw = route.trustDiscountBps ?? 0;
+    const trustDiscountBps = Number(trustDiscountBpsRaw);
+    if (!Number.isInteger(trustDiscountBps) || trustDiscountBps < 0 || trustDiscountBps > 10_000) {
+      throw new HttpError(400, `route "${routeName}" trustDiscountBps must be 0..10000`);
+    }
     routes.push({
       name: routeName,
       method: method as "GET" | "POST",
       path,
       priceSats,
       description: cleanStr(route.description, 160),
+      trustDiscountBps,
     });
   }
 
@@ -420,13 +428,37 @@ export async function deleteService(database: D1Like, id: string): Promise<void>
 
 export async function recordUsage(
   database: D1Like,
-  input: { serviceId: string; route: string; payer: string; sats: number; txid: string; status: number; ms: number },
+  input: {
+    serviceId: string;
+    route: string;
+    payer: string;
+    sats: number;
+    txid: string;
+    status: number;
+    ms: number;
+    discountSats?: number;
+  },
 ): Promise<void> {
   await database
+    .prepare("ALTER TABLE xgw_usage ADD COLUMN discount_sats INTEGER NOT NULL DEFAULT 0")
+    .run()
+    .catch(() => {});
+  await database
     .prepare(
-      "INSERT INTO xgw_usage (id, service_id, route, payer, sats, txid, status, ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      "INSERT INTO xgw_usage (id, service_id, route, payer, sats, discount_sats, txid, status, ms, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
-    .bind(newId("xgu"), input.serviceId, input.route, input.payer, input.sats, input.txid, input.status, input.ms, nowIso())
+    .bind(
+      newId("xgu"),
+      input.serviceId,
+      input.route,
+      input.payer,
+      input.sats,
+      input.discountSats ?? 0,
+      input.txid,
+      input.status,
+      input.ms,
+      nowIso(),
+    )
     .run();
   if (input.sats > 0) {
     await database

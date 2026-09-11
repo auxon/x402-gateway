@@ -67,6 +67,8 @@ export interface Env {
   MAX_RESPONSE_BYTES?: string;
   MAX_REQUEST_BYTES?: string;
   RATE_LIMIT_PER_MIN?: string;
+  /** Base URL of the agentpay API for trust-attestation verification. */
+  AGENTPAY_PUBLIC_URL?: string;
   /** Base64 32-byte AES-GCM key encrypting upstream auth secrets at rest. */
   GATEWAY_CREDS_KEY?: string;
   /** Pepper for admin-key hashes (dual-check accepts legacy unpeppered). */
