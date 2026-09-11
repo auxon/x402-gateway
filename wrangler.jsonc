@@ -1,0 +1,28 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "x402-gateway",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-20",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "preview_urls": true,
+  "routes": [
+    { "pattern": "entangleit.com/x402gateway", "zone_name": "entangleit.com" },
+    { "pattern": "entangleit.com/x402gateway/*", "zone_name": "entangleit.com" }
+  ],
+  "d1_databases": [{ "binding": "DB", "database_name": "entangleit", "database_id": "8f6c1ac7-ab0c-4133-a037-6ac1ed6afa6e" }],
+  "kv_namespaces": [{ "binding": "METER", "id": "5e067a7e5a504fc88c167c4a8db729ab" }],
+  "vars": {
+    "PUBLIC_SITE": "https://entangleit.com",
+    "PUBLIC_BASE": "https://entangleit.com/x402gateway",
+    "WORKERS_DEV_BASE": "https://x402-gateway.richard-hein.workers.dev",
+    "ARC_URL": "https://arc.gorillapool.io/v1",
+    "MAX_ROUTES_PER_SERVICE": "20",
+    "MAX_SERVICES_PER_IP_PER_DAY": "10",
+    "UPSTREAM_TIMEOUT_MS": "20000",
+    "MAX_RESPONSE_BYTES": "524288",
+    "MAX_REQUEST_BYTES": "65536",
+    "RATE_LIMIT_PER_MIN": "60"
+  },
+  "observability": { "enabled": true, "head_sampling_rate": 1 }
+}

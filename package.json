@@ -1,0 +1,25 @@
+{
+  "name": "x402-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hosted x402 gateway: register any upstream API with a price and get a paid pay-per-call endpoint",
+  "scripts": {
+    "dev": "wrangler dev --port 8790",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test 'test/**/*.test.mjs'",
+    "db:apply": "wrangler d1 execute entangleit --file=schema.sql --remote",
+    "db:apply:local": "wrangler d1 execute entangleit --file=schema.sql --local"
+  },
+  "dependencies": {
+    "@bsv/sdk": "^2.4.1",
+    "hono": "^4.7.0",
+    "stripe": "^22.6.2"
+  },
+  "devDependencies": {
+    "@types/node": "^22.16.5",
+    "typescript": "^5.7.0",
+    "wrangler": "^4.65.0"
+  }
+}
